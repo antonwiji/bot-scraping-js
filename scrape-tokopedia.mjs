@@ -1,4 +1,4 @@
-import { chromium, firefox, webkit } from "playwright";
+import { chromium } from "playwright";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -68,6 +68,7 @@ function isTokopediaProductUrl(raw) {
 async function loadExistingJsonl(outFile) {
   const seen = new Set();
   let lines = 0;
+
   if (!fs.existsSync(outFile)) return { seen, lines };
 
   const data = await fsp.readFile(outFile, "utf8");
@@ -87,34 +88,8 @@ async function appendJsonl(outFile, row) {
   await fsp.appendFile(outFile, JSON.stringify(row) + "\n", "utf8");
 }
 
-async function saveDiagnostics(page, prefix) {
-  try {
-    const ts = Date.now();
-    await page.screenshot({ path: `${prefix}.${ts}.png`, fullPage: true }).catch(() => {});
-    const html = await page.content().catch(() => "");
-    if (html) await fsp.writeFile(`${prefix}.${ts}.html`, html, "utf8").catch(() => {});
-  } catch {}
-}
-
-// Retry goto (buat network flaky / http2 error di sebagian kondisi)
-async function safeGoto(page, url, tries = 4) {
-  let lastErr = null;
-  for (let i = 1; i <= tries; i++) {
-    try {
-      await page.goto(url, { waitUntil: "commit", timeout: 90_000 });
-      await page.waitForTimeout(1500);
-      return;
-    } catch (e) {
-      lastErr = e;
-      await page.evaluate(() => window.stop()).catch(() => {});
-      const backoff = 1200 * i;
-      console.log(`[safeGoto] retry ${i}/${tries} after ${backoff}ms -> ${e?.message || e}`);
-      await page.waitForTimeout(backoff);
-      await page.reload({ waitUntil: "commit", timeout: 90_000 }).catch(() => {});
-      await page.waitForTimeout(800);
-    }
-  }
-  throw lastErr;
+async function appendFail(outFail, row) {
+  await fsp.appendFile(outFail, JSON.stringify(row) + "\n", "utf8");
 }
 
 async function autoScroll(page, { steps = 10, stepPx = 1200, waitMs = 900 } = {}) {
@@ -128,12 +103,67 @@ async function autoScroll(page, { steps = 10, stepPx = 1200, waitMs = 900 } = {}
   }
 }
 
-async function waitForListingReady(page, timeoutMs = 45_000) {
+async function saveDiagnostics(page, prefix) {
+  try {
+    const ts = Date.now();
+    await page.screenshot({ path: `${prefix}.${ts}.png`, fullPage: true }).catch(() => {});
+    const html = await page.content().catch(() => "");
+    if (html) await fsp.writeFile(`${prefix}.${ts}.html`, html, "utf8").catch(() => {});
+  } catch {}
+}
+
+/**
+ * VPS-stable goto:
+ * - setiap retry pakai page baru (koneksi fresh)
+ */
+async function safeOpenPage(context, url, tries = 6) {
+  let lastErr = null;
+  for (let i = 1; i <= tries; i++) {
+    const p = await context.newPage();
+    try {
+      await p.goto(url, { waitUntil: "commit", timeout: 120_000 });
+      await p.waitForLoadState("domcontentloaded", { timeout: 120_000 }).catch(() => {});
+      await p.waitForTimeout(1000);
+      return p;
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      console.log(`[safeOpenPage] retry ${i}/${tries} -> ${msg}`);
+      await p.close().catch(() => {});
+      const backoff = Math.min(1500 * i, 12_000);
+      await sleep(backoff);
+    }
+  }
+  throw lastErr;
+}
+
+async function safeGotoInPlace(page, url, tries = 6) {
+  let lastErr = null;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      await page.goto(url, { waitUntil: "commit", timeout: 120_000 });
+      await page.waitForLoadState("domcontentloaded", { timeout: 120_000 }).catch(() => {});
+      await page.waitForTimeout(1200);
+      return;
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.message || e);
+      console.log(`[safeGotoInPlace] retry ${i}/${tries} -> ${msg}`);
+      await page.evaluate(() => window.stop()).catch(() => {});
+      const backoff = Math.min(1500 * i, 12_000);
+      await sleep(backoff);
+      await page.reload({ waitUntil: "commit", timeout: 120_000 }).catch(() => {});
+      await page.waitForTimeout(800);
+    }
+  }
+  throw lastErr;
+}
+
+async function waitForListingReady(page, timeoutMs = 60_000) {
   await page.waitForSelector("body", { timeout: timeoutMs });
   await page.waitForSelector('a[data-testid="lnkProductContainer"]', { timeout: timeoutMs });
 }
 
-// Ambil href dari anchor yang kamu sebutkan
 async function getListingProductUrls(page) {
   await autoScroll(page);
 
@@ -157,19 +187,15 @@ async function getListingProductUrls(page) {
   return uniq;
 }
 
-// Scrape PDP pakai selector kamu
 async function scrapePdp(context, productUrl) {
-  const p = await context.newPage();
+  const p = await safeOpenPage(context, productUrl, 6);
   try {
-    await safeGoto(p, productUrl);
-
     const titleLoc = p.locator('[data-testid="lblPDPDetailProductName"]');
     const priceLoc = p.locator('[data-testid="lblPDPDetailProductPrice"]');
     const descLoc  = p.locator('[data-testid="lblPDPDescriptionProduk"]');
 
-    await titleLoc.first().waitFor({ timeout: 35_000 });
+    await titleLoc.first().waitFor({ timeout: 60_000 });
 
-    // pastikan deskripsi ke-load
     await descLoc.first().scrollIntoViewIfNeeded().catch(() => {});
     await p.waitForTimeout(250);
 
@@ -190,47 +216,6 @@ async function scrapePdp(context, productUrl) {
   }
 }
 
-async function launchBrowser(browserName, headless, slowMo) {
-  const name = String(browserName || "firefox").toLowerCase();
-
-  // NOTE:
-  // - firefox/webkit: biasanya lolos dari ERR_HTTP2_PROTOCOL_ERROR yang kamu alami di headless chromium
-  // - chrome channel: pakai Chrome sistem (kadang lebih stabil), tapi butuh Chrome terinstall
-  if (name === "webkit") {
-    return webkit.launch({ headless, slowMo });
-  }
-
-  if (name === "chromium") {
-    return chromium.launch({
-      headless,
-      slowMo,
-      args: [
-        process.platform === "linux" ? "--no-sandbox" : "",
-        "--disable-dev-shm-usage",
-        "--disable-quic",
-        "--disable-blink-features=AutomationControlled",
-      ].filter(Boolean),
-    });
-  }
-
-  if (name === "chrome") {
-    return chromium.launch({
-      channel: "chrome",
-      headless,
-      slowMo,
-      args: [
-        process.platform === "linux" ? "--no-sandbox" : "",
-        "--disable-dev-shm-usage",
-        "--disable-quic",
-        "--disable-blink-features=AutomationControlled",
-      ].filter(Boolean),
-    });
-  }
-
-  // default firefox
-  return firefox.launch({ headless, slowMo });
-}
-
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
@@ -239,25 +224,32 @@ async function main() {
     "https://www.tokopedia.com/p/komputer-laptop/laptop";
 
   const target = Number(args.target ?? 2000);
-  const delayMs = Number(args.delay ?? 2500);
-  const maxRoundsNoNew = Number(args.maxNoNew ?? 10);
-  const browserName = args.browser ?? "firefox"; // DEFAULT FIREFOX
-  const headless = args.headful ? false : true;
-  const slowMo = Number(args.slowMo ?? (headless ? 0 : 120));
-  const out = args.out ?? "tokopedia_laptop.jsonl";
-  const blockImages = args.blockImages === undefined ? true : Boolean(args.blockImages);
+  const delayMs = Number(args.delay ?? 3200);
+  const maxNoNew = Number(args.maxNoNew ?? 12);
+  const out = args.out ?? "tokopedia_laptop_2000.jsonl";
+  const failOut = args.failOut ?? "failed_urls.jsonl";
 
   const absOut = path.resolve(out);
+  const absFail = path.resolve(failOut);
   const { seen, lines } = await loadExistingJsonl(absOut);
 
   console.log("Start URL :", startUrl);
-  console.log("Browser   :", browserName);
-  console.log("Headless  :", headless);
   console.log("Output    :", absOut);
+  console.log("Fail file :", absFail);
   console.log("Resume    :", lines, "lines | seen:", seen.size);
   console.log("Target    :", target);
+  console.log("Mode      : Chromium headful (recommended with xvfb-run)");
 
-  const browser = await launchBrowser(browserName, headless, slowMo);
+  const launchArgs = [];
+  if (process.platform === "linux") {
+    launchArgs.push("--no-sandbox", "--disable-dev-shm-usage");
+  }
+
+  // HEADFUL (buat xvfb)
+  const browser = await chromium.launch({
+    headless: false,
+    args: launchArgs,
+  });
 
   const context = await browser.newContext({
     locale: "id-ID",
@@ -270,84 +262,98 @@ async function main() {
     },
   });
 
-  // hemat bandwidth
-  if (blockImages) {
-    await context.route("**/*", (route) => {
-      const rt = route.request().resourceType();
-      if (["image", "font", "media"].includes(rt)) return route.abort();
-      return route.continue();
-    });
-  }
+  // Block resource & analytics buat stabil di VPS
+  await context.route("**/*", (route) => {
+    const req = route.request();
+    const rt = req.resourceType();
+    const url = req.url();
+
+    if (["image", "font", "media"].includes(rt)) return route.abort();
+    if (/google-analytics|doubleclick|facebook|clarity|hotjar|segment|amplitude|mixpanel|datadog/i.test(url))
+      return route.abort();
+
+    // OPTIONAL: block stylesheet kalau mau extra hemat (kalau bikin selector gagal, comment line ini)
+    // if (rt === "stylesheet") return route.abort();
+
+    return route.continue();
+  });
 
   const listPage = await context.newPage();
-  listPage.setDefaultTimeout(45_000);
-  listPage.setDefaultNavigationTimeout(90_000);
+  listPage.setDefaultTimeout(60_000);
+  listPage.setDefaultNavigationTimeout(120_000);
 
-  // START: goto kategori (pakai safeGoto)
-  await safeGoto(listPage, startUrl);
+  await safeGotoInPlace(listPage, startUrl, 6);
 
   let total = seen.size;
   let noNewRounds = 0;
 
-  while (total < target && noNewRounds < maxRoundsNoNew) {
+  while (total < target && noNewRounds < maxNoNew) {
     try {
-      await waitForListingReady(listPage, 45_000);
+      await waitForListingReady(listPage, 60_000);
 
-      const productUrls = await getListingProductUrls(listPage);
-      if (!productUrls.length) {
+      const urls = await getListingProductUrls(listPage);
+      if (!urls.length) {
         noNewRounds++;
-        console.log(`No product urls (round noNew=${noNewRounds}).`);
+        console.log(`No urls found (noNewRounds=${noNewRounds}).`);
         await saveDiagnostics(listPage, "diag_list_empty");
         await sleep(delayMs);
+        await listPage.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 1.4))).catch(() => {});
+        await listPage.waitForTimeout(1200);
         continue;
       }
 
       let added = 0;
 
-      for (const url of productUrls) {
+      for (const u of urls) {
         if (total >= target) break;
-        if (seen.has(url)) continue;
+        if (seen.has(u)) continue;
 
-        console.log(`> PDP: ${url}`);
+        console.log(`> PDP: ${u}`);
 
-        const pdp = await scrapePdp(context, url).catch((e) => {
-          console.log("  x PDP error:", e?.message || e);
-          return null;
-        });
+        try {
+          const pdp = await scrapePdp(context, u);
 
-        if (!pdp?.title) {
-          console.log("  - skip (no title)");
+          if (!pdp?.title) {
+            console.log("  - skip (no title)");
+            await appendFail(absFail, { url: u, reason: "no_title", at: new Date().toISOString() });
+            await sleep(delayMs);
+            continue;
+          }
+
+          const finalUrl = normalizeUrl(pdp.finalUrl) || u;
+
+          const row = {
+            category_url: startUrl,
+            url: finalUrl,
+            title: pdp.title,
+            price: pdp.price,
+            description: pdp.description,
+            scraped_at: new Date().toISOString(),
+          };
+
+          await appendJsonl(absOut, row);
+          seen.add(finalUrl);
+          total++;
+          added++;
+
+          console.log(`  + saved ${total}/${target} | ${pdp.title.slice(0, 70)}`);
+
+          const jitter = Math.floor(Math.random() * 700);
+          await sleep(delayMs + jitter);
+        } catch (e) {
+          const msg = String(e?.message || e);
+          console.log(`  x PDP error: ${msg}`);
+          await appendFail(absFail, { url: u, reason: msg, at: new Date().toISOString() });
           await sleep(delayMs);
-          continue;
         }
-
-        const finalUrl = normalizeUrl(pdp.finalUrl) || url;
-        const row = {
-          category_url: startUrl,
-          url: finalUrl,
-          title: pdp.title,
-          price: pdp.price,
-          description: pdp.description,
-          scraped_at: new Date().toISOString(),
-        };
-
-        await appendJsonl(absOut, row);
-        seen.add(finalUrl);
-        total++;
-        added++;
-
-        console.log(`  + saved ${total}/${target} | ${pdp.title.slice(0, 70)}`);
-
-        const jitter = Math.floor(Math.random() * 600);
-        await sleep(delayMs + jitter);
       }
 
       if (added === 0) noNewRounds++;
       else noNewRounds = 0;
 
-      // scroll untuk load produk baru di kategori
-      await listPage.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 1.4)));
-      await listPage.waitForTimeout(1200);
+      // scroll listing untuk load produk baru
+      await listPage.evaluate(() => window.scrollBy(0, Math.floor(window.innerHeight * 1.5))).catch(() => {});
+      await listPage.waitForTimeout(1400);
     } catch (e) {
       console.log("LIST ERROR:", e?.message || e);
       await saveDiagnostics(listPage, "diag_list_error");
@@ -357,10 +363,12 @@ async function main() {
   }
 
   await browser.close();
-  console.log(`\nDONE. Total saved: ${total}`);
-  console.log("File:", absOut);
 
-  if (noNewRounds >= maxRoundsNoNew) {
+  console.log(`\nDONE. Total saved: ${total}`);
+  console.log("Output:", absOut);
+  console.log("Failed:", absFail);
+
+  if (noNewRounds >= maxNoNew) {
     console.log("Stop karena tidak ada produk baru yang bertambah (stagnant).");
   }
 }
